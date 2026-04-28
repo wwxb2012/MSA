@@ -174,7 +174,7 @@ class ToyTokenizer:
 
     def __call__(self, text: str, add_special_tokens: bool = False) -> dict[str, list[int]]:
         del add_special_tokens
-        tokens = text.replace("\n", " \n ").split()
+        tokens = text.split()
         ids = []
         for token in tokens:
             self.vocab.setdefault(token, len(self.vocab))
