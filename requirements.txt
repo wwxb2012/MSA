@@ -5,3 +5,4 @@ torchvision==0.21.0
 transformers==4.51.3
 liger_kernel==0.5.10
 accelerate==1.0.1
+pyarrow
