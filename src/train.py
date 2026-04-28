@@ -20,10 +20,8 @@ import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
 
 from src.config.train_config import TrainConfig, load_train_config
-from src.msa.model import MSAForCausalLM
 from src.training.collator import MSACollatorConfig, MSATrainingCollator
 from src.training.dataset import MSAJsonlDataset
 
@@ -60,10 +58,7 @@ def main() -> int:
     dtype = resolve_torch_dtype(cfg.model.torch_dtype)
     autocast_context = make_autocast_context(device, dtype)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        cfg.model.model_path,
-        trust_remote_code=cfg.model.trust_remote_code,
-    )
+    tokenizer = load_tokenizer(cfg)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -101,12 +96,7 @@ def main() -> int:
 
     resume_dir = Path(cfg.checkpointing.resume_from_checkpoint) if cfg.checkpointing.resume_from_checkpoint else None
     model_path = str(resume_dir if resume_dir else cfg.model.model_path)
-    model = MSAForCausalLM.from_pretrained(
-        model_path,
-        attn_implementation=cfg.model.attn_implementation,
-        torch_dtype=dtype,
-        trust_remote_code=cfg.model.trust_remote_code,
-    )
+    model = load_model(model_path, cfg, dtype)
     model.to(device)
     if cfg.optimization.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
@@ -174,6 +164,7 @@ def train(
     micro_step = 0
     running_loss = 0.0
     grad_accum = cfg.optimization.gradient_accumulation_steps
+    last_checkpoint_step: int | None = None
 
     while global_step < cfg.optimization.max_steps:
         for batch in train_loader:
@@ -210,11 +201,13 @@ def train(
 
             if global_step % cfg.checkpointing.save_steps == 0:
                 save_checkpoint(output_dir, model, tokenizer, optimizer, scheduler, global_step, cfg)
+                last_checkpoint_step = global_step
 
             if global_step >= cfg.optimization.max_steps:
                 break
 
-    save_checkpoint(output_dir, model, tokenizer, optimizer, scheduler, global_step, cfg)
+    if last_checkpoint_step != global_step:
+        save_checkpoint(output_dir, model, tokenizer, optimizer, scheduler, global_step, cfg)
 
 
 @torch.no_grad()
@@ -275,6 +268,27 @@ def build_loader(
         collate_fn=collator,
         generator=generator if shuffle else None,
         pin_memory=torch.cuda.is_available(),
+    )
+
+
+def load_tokenizer(cfg: TrainConfig) -> Any:
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        cfg.model.model_path,
+        trust_remote_code=cfg.model.trust_remote_code,
+    )
+    return tokenizer
+
+
+def load_model(model_path: str, cfg: TrainConfig, dtype: torch.dtype) -> torch.nn.Module:
+    from src.msa.model import MSAForCausalLM
+
+    return MSAForCausalLM.from_pretrained(
+        model_path,
+        attn_implementation=cfg.model.attn_implementation,
+        torch_dtype=dtype,
+        trust_remote_code=cfg.model.trust_remote_code,
     )
 
 
@@ -437,7 +451,7 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+        torch.cuda.manual_seed_all()
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
