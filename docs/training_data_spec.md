@@ -135,6 +135,12 @@ queries.
 tokenize. It returns normalized Python dictionaries and can produce text
 segments with `doc_id` region labels for a future collator.
 
+`src/training/collator.py` provides the first tokenizer-aware collator. It
+serializes documents with the same document marker style as inference, resets
+`position_ids` to 0 for every document segment, and starts query/answer active
+context positions at `template_id_num + doc_top_k` (default `3 + 16`) to match
+the service-side MSA layout.
+
 The loader rejects samples when:
 
 1. the JSON line is not an object,
