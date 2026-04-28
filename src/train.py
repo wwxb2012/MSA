@@ -451,7 +451,7 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all()
+        torch.cuda.manual_seed_all(seed)
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
