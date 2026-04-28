@@ -5,3 +5,7 @@
 data/
 ckpt/
 src/evaluation/outputs
+training_data_public_sources/
+converted_training_data/
+.hf_home/
+.cache/
