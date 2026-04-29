@@ -6,6 +6,7 @@
 data/
 ckpt/
 src/evaluation/outputs
+outputs/train/
 training_data_public_sources/
 converted_training_data/
 .hf_home/
