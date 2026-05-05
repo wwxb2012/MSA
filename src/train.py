@@ -10,16 +10,21 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import shutil
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel
 
 from src.config.train_config import TrainConfig, load_train_config
 from src.training.collator import MSACollatorConfig, MSATrainingCollator
@@ -27,6 +32,18 @@ from src.training.dataset import MSAJsonlDataset
 
 
 TRAIN_STATE_FILE = "trainer_state.pt"
+
+
+@dataclass(frozen=True)
+class DistributedContext:
+    enabled: bool = False
+    rank: int = 0
+    local_rank: int = 0
+    world_size: int = 1
+
+    @property
+    def is_main_process(self) -> bool:
+        return self.rank == 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,12 +66,15 @@ def main() -> int:
     if args.save_steps is not None:
         cfg.checkpointing.save_steps = args.save_steps
 
-    set_seed(cfg.run.seed)
+    distributed = init_distributed()
+    set_seed(cfg.run.seed + distributed.rank)
     output_dir = Path(cfg.run.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    write_json(output_dir / "train_config.resolved.json", cfg.to_dict())
+    if distributed.is_main_process:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        write_json(output_dir / "train_config.resolved.json", cfg.to_dict())
+    distributed_barrier(distributed)
 
-    device = resolve_device(args.device)
+    device = resolve_device(args.device, distributed)
     dtype = resolve_torch_dtype(cfg.model.torch_dtype)
     autocast_context = make_autocast_context(device, dtype)
 
@@ -81,6 +101,7 @@ def main() -> int:
         num_workers=cfg.data.num_workers,
         max_samples=cfg.data.max_train_samples,
         seed=cfg.run.seed,
+        distributed=distributed,
     )
     eval_loader = None
     if cfg.data.validation_jsonl:
@@ -92,6 +113,7 @@ def main() -> int:
             num_workers=cfg.data.num_workers,
             max_samples=cfg.data.max_eval_samples,
             seed=cfg.run.seed,
+            distributed=distributed,
         )
 
     resume_dir = Path(cfg.checkpointing.resume_from_checkpoint) if cfg.checkpointing.resume_from_checkpoint else None
@@ -101,6 +123,8 @@ def main() -> int:
     if cfg.optimization.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
     apply_loss_weights(model, cfg)
+    if distributed.enabled:
+        model = wrap_distributed_model(model, device)
 
     optimizer = AdamW(
         model.parameters(),
@@ -118,28 +142,34 @@ def main() -> int:
     global_step = 0
     if resume_dir:
         global_step = load_training_state(resume_dir, optimizer, scheduler)
-        print(f"Resumed trainer state from {resume_dir} at global_step={global_step}")
+        if distributed.is_main_process:
+            print(f"Resumed trainer state from {resume_dir} at global_step={global_step}")
 
     eval_steps = args.eval_steps if args.eval_steps is not None else cfg.checkpointing.save_steps
     if args.dry_run:
-        dry_run_batch(model, train_loader, device, autocast_context)
+        dry_run_batch(model, train_loader, device, autocast_context, distributed)
+        cleanup_distributed(distributed)
         return 0
 
-    train(
-        cfg=cfg,
-        model=model,
-        train_loader=train_loader,
-        eval_loader=eval_loader,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        device=device,
-        autocast_context=autocast_context,
-        output_dir=output_dir,
-        tokenizer=tokenizer,
-        start_step=global_step,
-        eval_steps=eval_steps,
-    )
-    return 0
+    try:
+        train(
+            cfg=cfg,
+            model=model,
+            train_loader=train_loader,
+            eval_loader=eval_loader,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=device,
+            autocast_context=autocast_context,
+            output_dir=output_dir,
+            tokenizer=tokenizer,
+            start_step=global_step,
+            eval_steps=eval_steps,
+            distributed=distributed,
+        )
+        return 0
+    finally:
+        cleanup_distributed(distributed)
 
 
 def train(
@@ -156,7 +186,9 @@ def train(
     tokenizer: Any,
     start_step: int,
     eval_steps: int,
+    distributed: DistributedContext | None = None,
 ) -> None:
+    distributed = distributed or DistributedContext()
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
@@ -165,8 +197,11 @@ def train(
     running_loss = 0.0
     grad_accum = cfg.optimization.gradient_accumulation_steps
     last_checkpoint_step: int | None = None
+    epoch = 0
 
     while global_step < cfg.optimization.max_steps:
+        set_loader_epoch(train_loader, epoch)
+        epoch += 1
         for batch in train_loader:
             batch = move_batch_to_device(batch, device)
             with autocast_context():
@@ -192,22 +227,28 @@ def train(
             if global_step % cfg.logging.logging_steps == 0:
                 avg_loss = running_loss / max(1, cfg.logging.logging_steps * grad_accum)
                 lr = scheduler.get_last_lr()[0]
-                print(json.dumps({"step": global_step, "loss": avg_loss, "lr": lr}))
+                if distributed.is_main_process:
+                    print(json.dumps({"step": global_step, "loss": avg_loss, "lr": lr}))
                 running_loss = 0.0
 
             if eval_loader is not None and eval_steps > 0 and global_step % eval_steps == 0:
-                metrics = evaluate(model, eval_loader, device, autocast_context)
-                print(json.dumps({"step": global_step, "eval_loss": metrics["eval_loss"]}))
+                metrics = evaluate(model, eval_loader, device, autocast_context, distributed)
+                if distributed.is_main_process:
+                    print(json.dumps({"step": global_step, "eval_loss": metrics["eval_loss"]}))
 
             if global_step % cfg.checkpointing.save_steps == 0:
-                save_checkpoint(output_dir, model, tokenizer, optimizer, scheduler, global_step, cfg)
+                if distributed.is_main_process:
+                    save_checkpoint(output_dir, model, tokenizer, optimizer, scheduler, global_step, cfg)
+                distributed_barrier(distributed)
                 last_checkpoint_step = global_step
 
             if global_step >= cfg.optimization.max_steps:
                 break
 
     if last_checkpoint_step != global_step:
-        save_checkpoint(output_dir, model, tokenizer, optimizer, scheduler, global_step, cfg)
+        if distributed.is_main_process:
+            save_checkpoint(output_dir, model, tokenizer, optimizer, scheduler, global_step, cfg)
+        distributed_barrier(distributed)
 
 
 @torch.no_grad()
@@ -216,7 +257,9 @@ def evaluate(
     eval_loader: DataLoader,
     device: torch.device,
     autocast_context: Any,
+    distributed: DistributedContext | None = None,
 ) -> dict[str, float]:
+    distributed = distributed or DistributedContext()
     model.eval()
     total_loss = 0.0
     total_batches = 0
@@ -228,23 +271,36 @@ def evaluate(
             total_loss += float(outputs.loss.detach().cpu())
             total_batches += 1
     model.train()
+    if distributed.enabled:
+        totals = torch.tensor([total_loss, float(total_batches)], device=device)
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        total_loss = float(totals[0].detach().cpu())
+        total_batches = int(totals[1].detach().cpu())
     return {"eval_loss": total_loss / max(1, total_batches)}
 
 
-def dry_run_batch(model: torch.nn.Module, loader: DataLoader, device: torch.device, autocast_context: Any) -> None:
+def dry_run_batch(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    autocast_context: Any,
+    distributed: DistributedContext | None = None,
+) -> None:
+    distributed = distributed or DistributedContext()
     model.eval()
     batch = move_batch_to_device(next(iter(loader)), device)
     with torch.no_grad(), autocast_context():
         outputs = model(**model_batch_kwargs(batch))
-    print(
-        json.dumps(
-            {
-                "dry_run": True,
-                "loss": None if outputs.loss is None else float(outputs.loss.detach().cpu()),
-                "batch_shape": list(batch["input_ids"].shape),
-            }
+    if distributed.is_main_process:
+        print(
+            json.dumps(
+                {
+                    "dry_run": True,
+                    "loss": None if outputs.loss is None else float(outputs.loss.detach().cpu()),
+                    "batch_shape": list(batch["input_ids"].shape),
+                }
+            )
         )
-    )
 
 
 def build_loader(
@@ -256,17 +312,30 @@ def build_loader(
     num_workers: int,
     max_samples: int | None,
     seed: int,
+    distributed: DistributedContext | None = None,
 ) -> DataLoader:
+    distributed = distributed or DistributedContext()
     dataset = MSAJsonlDataset(jsonl_path, max_samples=max_samples)
+    sampler = None
+    if distributed.enabled:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=distributed.world_size,
+            rank=distributed.rank,
+            shuffle=shuffle,
+            seed=seed,
+            drop_last=False,
+        )
     generator = torch.Generator()
     generator.manual_seed(seed)
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,
         num_workers=num_workers,
         collate_fn=collator,
-        generator=generator if shuffle else None,
+        sampler=sampler,
+        generator=generator if shuffle and sampler is None else None,
         pin_memory=torch.cuda.is_available(),
     )
 
@@ -335,7 +404,7 @@ def save_checkpoint(
 ) -> None:
     checkpoint_dir = output_dir / f"checkpoint-{global_step}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(checkpoint_dir)
+    unwrap_model(model).save_pretrained(checkpoint_dir)
     tokenizer.save_pretrained(checkpoint_dir)
     torch.save(
         {
@@ -408,7 +477,15 @@ def apply_loss_weights(model: torch.nn.Module, cfg: TrainConfig) -> None:
             setattr(model, name, value)
 
 
-def resolve_device(requested: str) -> torch.device:
+def resolve_device(requested: str, distributed: DistributedContext | None = None) -> torch.device:
+    distributed = distributed or DistributedContext()
+    if distributed.enabled:
+        if requested == "cpu" or requested == "mps":
+            raise RuntimeError("Distributed training currently requires CUDA devices")
+        if not torch.cuda.is_available():
+            raise RuntimeError("torchrun distributed training was requested but CUDA is not available")
+        torch.cuda.set_device(distributed.local_rank)
+        return torch.device("cuda", distributed.local_rank)
     if requested != "auto":
         device = torch.device(requested)
         if device.type == "cuda" and not torch.cuda.is_available():
@@ -452,6 +529,50 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def init_distributed() -> DistributedContext:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
+        return DistributedContext()
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    if not torch.cuda.is_available():
+        raise RuntimeError("Distributed training requires CUDA; launch without torchrun for CPU training")
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl")
+    return DistributedContext(enabled=True, rank=rank, local_rank=local_rank, world_size=world_size)
+
+
+def cleanup_distributed(distributed: DistributedContext) -> None:
+    if distributed.enabled and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def distributed_barrier(distributed: DistributedContext) -> None:
+    if distributed.enabled:
+        dist.barrier()
+
+
+def wrap_distributed_model(model: torch.nn.Module, device: torch.device) -> DistributedDataParallel:
+    if device.type != "cuda":
+        raise RuntimeError("DistributedDataParallel wrapping requires a CUDA device")
+    return DistributedDataParallel(
+        model,
+        device_ids=[device.index],
+        output_device=device.index,
+        find_unused_parameters=True,
+    )
+
+
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if isinstance(model, DistributedDataParallel) else model
+
+
+def set_loader_epoch(loader: DataLoader, epoch: int) -> None:
+    sampler = getattr(loader, "sampler", None)
+    if hasattr(sampler, "set_epoch"):
+        sampler.set_epoch(epoch)
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
