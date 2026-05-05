@@ -133,7 +133,8 @@ def main() -> int:
     )
     scheduler = LambdaLR(
         optimizer,
-        make_cosine_schedule(
+        make_lr_schedule(
+            scheduler_type=cfg.optimization.lr_scheduler_type,
             warmup_steps=cfg.optimization.warmup_steps,
             max_steps=cfg.optimization.max_steps,
         ),
@@ -380,6 +381,24 @@ def move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[st
     for key, value in batch.items():
         moved[key] = value.to(device, non_blocking=True) if torch.is_tensor(value) else value
     return moved
+
+
+def make_lr_schedule(*, scheduler_type: str, warmup_steps: int, max_steps: int):
+    normalized = scheduler_type.lower()
+    if normalized == "cosine":
+        return make_cosine_schedule(warmup_steps=warmup_steps, max_steps=max_steps)
+    if normalized == "constant":
+        return make_constant_schedule(warmup_steps=warmup_steps)
+    raise ValueError(f"Unsupported lr_scheduler_type: {scheduler_type}")
+
+
+def make_constant_schedule(*, warmup_steps: int):
+    def lr_lambda(step: int) -> float:
+        if warmup_steps > 0 and step < warmup_steps:
+            return float(step) / float(max(1, warmup_steps))
+        return 1.0
+
+    return lr_lambda
 
 
 def make_cosine_schedule(*, warmup_steps: int, max_steps: int):
