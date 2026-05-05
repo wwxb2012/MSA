@@ -233,7 +233,7 @@ This command still loads the configured MSA model, so it requires
 
 ### 5.3 Real Fine-Tuning
 
-Example single-node launch:
+Example single-GPU launch:
 
 ```bash
 python src/train.py configs/train/minimal_pretrain.json \
@@ -245,10 +245,26 @@ python src/train.py configs/train/minimal_pretrain.json \
   --override checkpointing.save_steps=100
 ```
 
+Example single-node multi-GPU launch:
+
+```bash
+torchrun --standalone --nproc_per_node=8 src/train.py configs/train/minimal_pretrain.json \
+  --device cuda \
+  --override model.model_path=ckpt/MSA-4B \
+  --override data.train_jsonl=converted_training_data/msa_pretrain_conservative.jsonl \
+  --override run.output_dir=outputs/train/msa-minimal-pretrain \
+  --override optimization.max_steps=1000 \
+  --override checkpointing.save_steps=100
+```
+
 Notes:
 
-- The current entrypoint is a minimal single-process trainer. It does not set up
-  distributed data parallelism.
+- Plain `python src/train.py ...` is single-process and will use one CUDA
+  device. Use `torchrun` to enable DistributedDataParallel and spread batches
+  across multiple GPUs.
+- `optimization.per_device_train_batch_size` is per GPU. Effective batch size is
+  `per_device_train_batch_size * gradient_accumulation_steps * world_size`.
+- Checkpoint saving, config writing, and logging are performed by rank 0 only.
 - Use smaller `sequence.*` limits and larger gradient accumulation when memory
   is tight.
 - `logging.logging_steps` controls JSON progress lines printed to stdout.
