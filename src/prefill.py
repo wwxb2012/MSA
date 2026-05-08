@@ -17,7 +17,7 @@ from src.utils.cache import  copy_kv_cache_to_device, CustomDynamicCacheOnCPU
 from src.msa.model import MSAForCausalLM
 from src.utils.gpu_worker import GpuWorker
 from src.utils.tools import compose_input
-from src.types import Document, ProtocolConstants
+from src.msa_types import Document, ProtocolConstants
 
 @dataclass
 class BlockModelInput:
@@ -303,4 +303,3 @@ class PrefillStage1Worker(GpuWorker):
         }
 
         return kvcache_meta
-
