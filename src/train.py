@@ -8,14 +8,16 @@ cosine schedule, checkpointing, resume, and periodic evaluation hooks.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import math
 import os
 import random
 import shutil
+import sys
 from contextlib import nullcontext
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +62,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--distributed-backend", default="nccl", choices=["nccl", "gloo"])
     parser.add_argument("--distributed-timeout-minutes", type=int, default=60)
     parser.add_argument("--local-rank", "--local_rank", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=Path("outputs/log"),
+        help="Directory for teeing stdout/stderr into a timestamped training log.",
+    )
     return parser.parse_args()
 
 
@@ -72,11 +80,13 @@ def main() -> int:
         cfg.checkpointing.save_steps = args.save_steps
 
     distributed = init_distributed(args)
+    log_file = setup_print_logging(args.log_dir, distributed)
     set_seed(cfg.run.seed + distributed.rank)
     output_dir = Path(cfg.run.output_dir)
     if distributed.is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
         write_json(output_dir / "train_config.resolved.json", cfg.to_dict())
+        print(json.dumps({"log_file": str(log_file)}))
         if distributed.enabled:
             print(
                 json.dumps(
@@ -563,6 +573,72 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+class TeeStream:
+    def __init__(self, primary: Any, log_file: Any):
+        self.primary = primary
+        self.log_file = log_file
+
+    def write(self, data: str) -> int:
+        self.primary.write(data)
+        self.log_file.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        self.primary.flush()
+        self.log_file.flush()
+
+    def isatty(self) -> bool:
+        return bool(getattr(self.primary, "isatty", lambda: False)())
+
+    def fileno(self) -> int:
+        return self.primary.fileno()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.primary, name)
+
+
+def setup_print_logging(log_dir: Path, distributed: DistributedContext) -> Path:
+    log_dir = log_dir.expanduser()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = make_log_timestamp(distributed)
+    log_path = log_dir / f"{timestamp}.txt"
+
+    log_fh = log_path.open("a", encoding="utf-8", buffering=1)
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    sys.stdout = TeeStream(original_stdout, log_fh)
+    sys.stderr = TeeStream(original_stderr, log_fh)
+
+    def close_log() -> None:
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        log_fh.close()
+
+    atexit.register(close_log)
+    print(
+        json.dumps(
+            {
+                "training_log_started": timestamp,
+                "rank": distributed.rank,
+                "world_size": distributed.world_size,
+                "log_file": str(log_path),
+            }
+        )
+    )
+    return log_path
+
+
+def make_log_timestamp(distributed: DistributedContext) -> str:
+    timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S") if distributed.is_main_process else None
+    if distributed.enabled:
+        timestamp_holder = [timestamp]
+        dist.broadcast_object_list(timestamp_holder, src=0)
+        timestamp = timestamp_holder[0]
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    return timestamp
 
 
 def init_distributed(args: argparse.Namespace | None = None) -> DistributedContext:
