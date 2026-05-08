@@ -15,6 +15,7 @@ import random
 import shutil
 from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,7 @@ class DistributedContext:
     rank: int = 0
     local_rank: int = 0
     world_size: int = 1
+    backend: str = "none"
 
     @property
     def is_main_process(self) -> bool:
@@ -55,6 +57,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-steps", type=int, default=None, help="Override checkpoint save interval")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--dry-run", action="store_true", help="Build all objects and run one eval-style batch without optimizer step")
+    parser.add_argument("--distributed-backend", default="nccl", choices=["nccl", "gloo"])
+    parser.add_argument("--distributed-timeout-minutes", type=int, default=60)
+    parser.add_argument("--local-rank", "--local_rank", type=int, default=None, help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -66,12 +71,22 @@ def main() -> int:
     if args.save_steps is not None:
         cfg.checkpointing.save_steps = args.save_steps
 
-    distributed = init_distributed()
+    distributed = init_distributed(args)
     set_seed(cfg.run.seed + distributed.rank)
     output_dir = Path(cfg.run.output_dir)
     if distributed.is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
         write_json(output_dir / "train_config.resolved.json", cfg.to_dict())
+        if distributed.enabled:
+            print(
+                json.dumps(
+                    {
+                        "distributed": True,
+                        "backend": distributed.backend,
+                        "world_size": distributed.world_size,
+                    }
+                )
+            )
     distributed_barrier(distributed)
 
     device = resolve_device(args.device, distributed)
@@ -550,17 +565,29 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def init_distributed() -> DistributedContext:
+def init_distributed(args: argparse.Namespace | None = None) -> DistributedContext:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size <= 1:
         return DistributedContext()
     rank = int(os.environ["RANK"])
-    local_rank = int(os.environ["LOCAL_RANK"])
-    if not torch.cuda.is_available():
+    local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank if args and args.local_rank is not None else 0))
+    backend = args.distributed_backend if args is not None else "nccl"
+    timeout_minutes = args.distributed_timeout_minutes if args is not None else 60
+    if backend == "nccl" and not torch.cuda.is_available():
         raise RuntimeError("Distributed training requires CUDA; launch without torchrun for CPU training")
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl")
-    return DistributedContext(enabled=True, rank=rank, local_rank=local_rank, world_size=world_size)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    dist.init_process_group(
+        backend=backend,
+        timeout=timedelta(minutes=timeout_minutes),
+    )
+    return DistributedContext(
+        enabled=True,
+        rank=rank,
+        local_rank=local_rank,
+        world_size=world_size,
+        backend=backend,
+    )
 
 
 def cleanup_distributed(distributed: DistributedContext) -> None:
