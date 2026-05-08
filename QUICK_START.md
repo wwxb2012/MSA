@@ -22,7 +22,7 @@ MSA/
     ├── msa_service.py             # Multi-GPU inference engine (MSAEngine)
     ├── prefill.py                 # Stage 1 prefill worker
     ├── benchmarks.py              # Benchmark registry & specs
-    └── types.py                   # Core type definitions
+    └── msa_types.py               # Core type definitions
 ```
 
 ## Installation
