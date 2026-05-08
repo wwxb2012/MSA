@@ -245,6 +245,16 @@ python src/train.py configs/train/minimal_pretrain.json \
   --override checkpointing.save_steps=100
 ```
 
+By default, `src/train.py` mirrors stdout and stderr into
+`outputs/log/<year>-<month>-<day>-<hour>-<minute>-<second>.txt`, using the
+training start time. Override the log directory with `--log-dir`:
+
+```bash
+python src/train.py configs/train/minimal_pretrain.json \
+  --device cuda \
+  --log-dir outputs/log
+```
+
 Example single-node multi-GPU launch:
 
 ```bash
@@ -291,6 +301,8 @@ Notes:
 - Plain `python src/train.py ...` is single-process and will use one CUDA
   device. Use `torchrun` to enable DistributedDataParallel and spread batches
   across multiple GPUs.
+- Console output is also written to the timestamped log file. In distributed
+  runs, rank 0 broadcasts the timestamp so all workers use the same log file.
 - `optimization.per_device_train_batch_size` is per GPU. Effective batch size is
   `per_device_train_batch_size * gradient_accumulation_steps * world_size`.
 - Checkpoint saving, config writing, and logging are performed by rank 0 only.
