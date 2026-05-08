@@ -257,6 +257,35 @@ torchrun --standalone --nproc_per_node=8 src/train.py configs/train/minimal_pret
   --override checkpointing.save_steps=100
 ```
 
+Example two-node / 16-GPU launch, run once on each node:
+
+```bash
+# node 0
+torchrun --nnodes=2 --nproc_per_node=8 --node_rank=0 \
+  --master_addr=<node0-ip-or-hostname> --master_port=29500 \
+  src/train.py configs/train/minimal_pretrain.json \
+  --device cuda \
+  --distributed-backend nccl
+
+# node 1
+torchrun --nnodes=2 --nproc_per_node=8 --node_rank=1 \
+  --master_addr=<node0-ip-or-hostname> --master_port=29500 \
+  src/train.py configs/train/minimal_pretrain.json \
+  --device cuda \
+  --distributed-backend nccl
+```
+
+Example four-node / 32-GPU launch, run once on each node with the matching
+`--node_rank` value from `0` to `3`:
+
+```bash
+torchrun --nnodes=4 --nproc_per_node=8 --node_rank=<0-3> \
+  --master_addr=<node0-ip-or-hostname> --master_port=29500 \
+  src/train.py configs/train/minimal_pretrain.json \
+  --device cuda \
+  --distributed-backend nccl
+```
+
 Notes:
 
 - Plain `python src/train.py ...` is single-process and will use one CUDA
@@ -265,6 +294,11 @@ Notes:
 - `optimization.per_device_train_batch_size` is per GPU. Effective batch size is
   `per_device_train_batch_size * gradient_accumulation_steps * world_size`.
 - Checkpoint saving, config writing, and logging are performed by rank 0 only.
+- For multi-node training, every node must see the same `model.model_path`,
+  `data.train_jsonl`, optional `data.validation_jsonl`, and `run.output_dir`
+  paths. Use shared storage or identical mounted paths.
+- If NCCL rendezvous hangs, verify inter-node networking, firewall rules,
+  `MASTER_ADDR`, `MASTER_PORT`, and `NCCL_SOCKET_IFNAME`.
 - Use smaller `sequence.*` limits and larger gradient accumulation when memory
   is tight.
 - `logging.logging_steps` controls JSON progress lines printed to stdout.
