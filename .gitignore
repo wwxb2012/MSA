@@ -11,3 +11,11 @@ training_data_public_sources/
 converted_training_data/
 .hf_home/
 .cache/
+.DS_Store
+**/.DS_Store
+._*
+**/._*
+__MACOSX/
+**/__MACOSX/
+Thumbs.db
+**/Thumbs.db
