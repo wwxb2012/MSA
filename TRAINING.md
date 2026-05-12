@@ -78,6 +78,42 @@ Conservative defaults:
 - Caps each normalized source with `--max-samples-per-source`.
 - Uses deterministic hash sampling with `--sample-rate` and `--seed`.
 
+For long-context MSA pretraining on large GPU pools, generate more candidate
+documents per query instead of the default 1 positive + up to 3 negatives:
+
+```bash
+python scripts/convert_public_sources_to_msa_jsonl.py \
+  --input-root training_data_public_sources \
+  --output-jsonl converted_training_data/msa_pretrain_64docs.jsonl \
+  --manifest converted_training_data/msa_pretrain_64docs_manifest.json \
+  --skipped-report converted_training_data/msa_pretrain_64docs_skipped.json \
+  --num-workers 32 \
+  --target-documents-per-sample 64 \
+  --require-target-documents \
+  --supplemental-negatives \
+  --supplemental-negative-pool-size 100000 \
+  --allow-missing-negatives-with-supplemental \
+  --max-negatives 16
+```
+
+This mode supplements explicit row negatives with deterministic same-source
+random negatives and records the added count in sample metadata.
+
+Paper-aligned CPT approximation:
+
+- The paper reports 17,852,825 CPT queries and 158.95B CPT tokens, but does not
+  publish an exact public data manifest.
+- Treat `converted_training_data/msa_pretrain_64docs.jsonl` as a public proxy,
+  not the official author dataset.
+- `--target-documents-per-sample 64` controls candidate-document count, not
+  sequence length. Set `sequence.max_seq_len` and document token limits in the
+  training config to control actual tokens.
+- Use the train log fields `train_tokens_seen`, `total_train_tokens_seen`, and
+  `estimated_total_train_tokens` to compare the actual run against the 158.95B
+  token budget. In main CPT, `total_train_tokens_seen` includes warmup tokens
+  when `model.model_path` points at the warmup checkpoint with
+  `token_accounting.json`.
+
 ### 2.3 Tiny Debug Dataset
 
 For a fully offline pipeline check, run:
