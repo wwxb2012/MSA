@@ -13,7 +13,7 @@ def save_checkpoint(model, tokenizer, save_model_path):
 def main(origin_model_path, save_model_path):
     router_layer_idx = os.environ.get("ROUTER_LAYER_IDX", "all")
     aux_loss = os.environ.get("AUX_LOSS", "false") == "true"
-    lmloss_weigth = float(os.environ.get("LMLOSS_WEIGHT", 1.0))
+    lmloss_weight = float(os.environ.get("LMLOSS_WEIGHT", 1.0))
     auxloss_weight = float(os.environ.get("AUX_LOSS_WEIGHT", 0.1))
     recloss_weight = float(os.environ.get("REC_LOSS_WEIGHT", 0.0))
     ansloss_weight = float(os.environ.get("ANS_LOSS_WEIGHT", 1.0))
@@ -33,7 +33,7 @@ def main(origin_model_path, save_model_path):
     msa_config = {
         "router_layer_idx": router_layer_idx,
         "aux_loss": aux_loss,
-        "lmloss_weigth": lmloss_weigth,
+        "lmloss_weight": lmloss_weight,
         "auxloss_weight": auxloss_weight,
         "recloss_weight": recloss_weight,
         "ansloss_weight": ansloss_weight,
