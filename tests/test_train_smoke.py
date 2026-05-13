@@ -85,6 +85,16 @@ class TrainingSmokeTest(unittest.TestCase):
             )
             self.assertTrue((Path(tmp) / "checkpoint-1" / train_module.TRAIN_STATE_FILE).exists())
             self.assertTrue((Path(tmp) / "last" / train_module.TRAIN_STATE_FILE).exists())
+            state = train_module.load_torch_state(Path(tmp) / "checkpoint-1" / train_module.TRAIN_STATE_FILE)
+            self.assertNotIn("train_tokens_seen", state)
+            self.assertEqual(
+                train_module.load_token_accounting(Path(tmp) / "checkpoint-1"),
+                int(self.batch["attention_mask"].sum().item()),
+            )
+            self.assertEqual(
+                train_module.load_token_accounting(Path(tmp) / "last"),
+                int(self.batch["attention_mask"].sum().item()),
+            )
 
     def test_checkpoint_save_and_load_are_consistent(self) -> None:
         import src.train as train_module
@@ -125,7 +135,25 @@ class TrainingSmokeTest(unittest.TestCase):
             )
             step = train_module.load_training_state(checkpoint_dir, new_optimizer, new_scheduler)
             self.assertEqual(step, 2)
+            self.assertEqual(train_module.load_token_accounting(checkpoint_dir), 0)
             self.assertEqual(new_scheduler.state_dict()["last_epoch"], scheduler.state_dict()["last_epoch"])
+
+    def test_prior_stage_token_accounting_is_loaded_for_main_stage(self) -> None:
+        import src.train as train_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            warmup_last = Path(tmp) / "warmup" / "last"
+            warmup_last.mkdir(parents=True)
+            train_module.write_token_accounting(
+                warmup_last,
+                global_step=1000,
+                train_tokens_seen=123456,
+            )
+            cfg = SimpleNamespace(
+                run=SimpleNamespace(name="msa-cpt-main-8k"),
+                model=SimpleNamespace(model_path=str(warmup_last)),
+            )
+            self.assertEqual(train_module.detect_prior_stage_train_tokens(cfg, None), 123456)
 
     def test_saved_checkpoint_loads_for_inference_style_forward(self) -> None:
         import src.train as train_module
