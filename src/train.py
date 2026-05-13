@@ -15,6 +15,7 @@ import os
 import random
 import shutil
 import sys
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -35,6 +36,7 @@ from src.training.dataset import MSAJsonlDataset
 
 
 TRAIN_STATE_FILE = "trainer_state.pt"
+TOKEN_ACCOUNTING_FILE = "token_accounting.json"
 
 
 @dataclass(frozen=True)
@@ -145,8 +147,8 @@ def main() -> int:
     model_path = str(resume_dir if resume_dir else cfg.model.model_path)
     model = load_model(model_path, cfg, dtype)
     model.to(device)
-    if cfg.optimization.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
+    if cfg.optimization.gradient_checkpointing:
+        enable_gradient_checkpointing(model)
     apply_loss_weights(model, cfg)
     if distributed.enabled:
         model = wrap_distributed_model(model, device)
@@ -166,10 +168,21 @@ def main() -> int:
     )
 
     global_step = 0
+    train_tokens_seen = 0
     if resume_dir:
         global_step = load_training_state(resume_dir, optimizer, scheduler)
+        train_tokens_seen = load_token_accounting(resume_dir)
         if distributed.is_main_process:
-            print(f"Resumed trainer state from {resume_dir} at global_step={global_step}")
+            print(
+                json.dumps(
+                    {
+                        "resumed_from": str(resume_dir),
+                        "global_step": global_step,
+                        "train_tokens_seen": train_tokens_seen,
+                    }
+                )
+            )
+    prior_stage_train_tokens = detect_prior_stage_train_tokens(cfg, resume_dir)
 
     eval_steps = args.eval_steps if args.eval_steps is not None else cfg.checkpointing.save_steps
     if args.dry_run:
@@ -190,6 +203,8 @@ def main() -> int:
             output_dir=output_dir,
             tokenizer=tokenizer,
             start_step=global_step,
+            start_train_tokens=train_tokens_seen,
+            prior_stage_train_tokens=prior_stage_train_tokens,
             eval_steps=eval_steps,
             distributed=distributed,
         )
@@ -212,6 +227,8 @@ def train(
     tokenizer: Any,
     start_step: int,
     eval_steps: int,
+    start_train_tokens: int = 0,
+    prior_stage_train_tokens: int = 0,
     distributed: DistributedContext | None = None,
 ) -> None:
     distributed = distributed or DistributedContext()
@@ -219,17 +236,59 @@ def train(
     optimizer.zero_grad(set_to_none=True)
 
     global_step = start_step
+    train_tokens_seen = int(start_train_tokens)
+    prior_stage_train_tokens = int(prior_stage_train_tokens)
     micro_step = 0
+    accumulated_micro_tokens = 0
     running_loss = 0.0
     grad_accum = cfg.optimization.gradient_accumulation_steps
     last_checkpoint_step: int | None = None
     epoch = 0
+    train_started_at = datetime.now()
+    train_start_monotonic = time.monotonic()
+    if distributed.is_main_process:
+        max_seq_len = getattr(getattr(cfg, "sequence", None), "max_seq_len", None)
+        per_device_batch = getattr(
+            cfg.optimization,
+            "per_device_train_batch_size",
+            getattr(train_loader, "batch_size", None) or 1,
+        )
+        theoretical_tokens_per_step = None
+        theoretical_total_tokens = None
+        if max_seq_len is not None:
+            theoretical_tokens_per_step = (
+                distributed.world_size
+                * per_device_batch
+                * cfg.optimization.gradient_accumulation_steps
+                * max_seq_len
+            )
+            theoretical_total_tokens = theoretical_tokens_per_step * cfg.optimization.max_steps
+        estimated_total_tokens = (
+            None
+            if theoretical_total_tokens is None
+            else prior_stage_train_tokens + theoretical_total_tokens
+        )
+        print(
+            json.dumps(
+                {
+                    "token_accounting": "attention_mask_non_padding_tokens",
+                    "train_started_at": train_started_at.isoformat(timespec="seconds"),
+                    "start_train_tokens": train_tokens_seen,
+                    "prior_stage_train_tokens": prior_stage_train_tokens,
+                    "total_train_tokens_seen": prior_stage_train_tokens + train_tokens_seen,
+                    "theoretical_tokens_per_optimizer_step_at_max_seq_len": theoretical_tokens_per_step,
+                    "theoretical_total_tokens_at_max_steps": theoretical_total_tokens,
+                    "estimated_total_train_tokens_at_max_steps": estimated_total_tokens,
+                }
+            )
+        )
 
     while global_step < cfg.optimization.max_steps:
         set_loader_epoch(train_loader, epoch)
         epoch += 1
         for batch in train_loader:
             batch = move_batch_to_device(batch, device)
+            accumulated_micro_tokens += count_batch_tokens(batch)
             with autocast_context():
                 outputs = model(**model_batch_kwargs(batch))
                 loss = outputs.loss
@@ -249,12 +308,50 @@ def train(
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
+            optimizer_step_tokens = reduce_token_count(accumulated_micro_tokens, device, distributed)
+            train_tokens_seen += optimizer_step_tokens
+            accumulated_micro_tokens = 0
 
             if global_step % cfg.logging.logging_steps == 0:
                 avg_loss = running_loss / max(1, cfg.logging.logging_steps * grad_accum)
                 lr = scheduler.get_last_lr()[0]
                 if distributed.is_main_process:
-                    print(json.dumps({"step": global_step, "loss": avg_loss, "lr": lr}))
+                    elapsed_seconds = time.monotonic() - train_start_monotonic
+                    completed_steps = global_step - start_step
+                    remaining_steps = cfg.optimization.max_steps - global_step
+                    remaining_seconds = estimate_remaining_seconds(
+                        start_step=start_step,
+                        current_step=global_step,
+                        max_steps=cfg.optimization.max_steps,
+                        elapsed_seconds=elapsed_seconds,
+                    )
+                    estimated_finish_time = estimate_finish_time(remaining_seconds)
+                    sec_per_step = elapsed_seconds / max(1, completed_steps)
+                    total_train_tokens_seen = prior_stage_train_tokens + train_tokens_seen
+                    estimated_total_tokens = estimate_total_train_tokens(cfg, train_loader, distributed)
+                    if estimated_total_tokens is not None:
+                        estimated_total_tokens += prior_stage_train_tokens
+                    print(
+                        json.dumps(
+                            {
+                                "time": datetime.now().isoformat(timespec="seconds"),
+                                "step": global_step,
+                                "max_steps": cfg.optimization.max_steps,
+                                "loss": avg_loss,
+                                "lr": lr,
+                                "elapsed": format_duration_compact(elapsed_seconds),
+                                "sec_per_step": round(sec_per_step, 4),
+                                "remaining_steps": remaining_steps,
+                                "eta": format_duration_compact(remaining_seconds),
+                                "eta_time": estimated_finish_time,
+                                "step_train_tokens": format_count(optimizer_step_tokens),
+                                "train_tokens_seen": format_count(train_tokens_seen),
+                                "prior_stage_train_tokens": format_count(prior_stage_train_tokens),
+                                "total_train_tokens_seen": format_count(total_train_tokens_seen),
+                                "estimated_total_train_tokens": format_count_or_none(estimated_total_tokens),
+                            }
+                        )
+                    )
                 running_loss = 0.0
 
             if eval_loader is not None and eval_steps > 0 and global_step % eval_steps == 0:
@@ -264,7 +361,17 @@ def train(
 
             if global_step % cfg.checkpointing.save_steps == 0:
                 if distributed.is_main_process:
-                    save_checkpoint(output_dir, model, tokenizer, optimizer, scheduler, global_step, cfg)
+                    save_checkpoint(
+                        output_dir,
+                        model,
+                        tokenizer,
+                        optimizer,
+                        scheduler,
+                        global_step,
+                        cfg,
+                        train_tokens_seen=train_tokens_seen,
+                        prior_stage_train_tokens=prior_stage_train_tokens,
+                    )
                 distributed_barrier(distributed)
                 last_checkpoint_step = global_step
 
@@ -273,8 +380,30 @@ def train(
 
     if last_checkpoint_step != global_step:
         if distributed.is_main_process:
-            save_checkpoint(output_dir, model, tokenizer, optimizer, scheduler, global_step, cfg)
+            save_checkpoint(
+                output_dir,
+                model,
+                tokenizer,
+                optimizer,
+                scheduler,
+                global_step,
+                cfg,
+                train_tokens_seen=train_tokens_seen,
+                prior_stage_train_tokens=prior_stage_train_tokens,
+            )
         distributed_barrier(distributed)
+    if distributed.is_main_process:
+        print(
+            json.dumps(
+                {
+                    "training_complete": True,
+                    "global_step": global_step,
+                    "train_tokens_seen": format_count(train_tokens_seen),
+                    "prior_stage_train_tokens": format_count(prior_stage_train_tokens),
+                    "total_train_tokens_seen": format_count(prior_stage_train_tokens + train_tokens_seen),
+                }
+            )
+        )
 
 
 @torch.no_grad()
@@ -408,6 +537,104 @@ def move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[st
     return moved
 
 
+def count_batch_tokens(batch: dict[str, Any]) -> int:
+    attention_mask = batch.get("attention_mask")
+    if torch.is_tensor(attention_mask):
+        return int(attention_mask.detach().sum().item())
+    input_ids = batch.get("input_ids")
+    if torch.is_tensor(input_ids):
+        return int(input_ids.numel())
+    return 0
+
+
+def reduce_token_count(local_count: int, device: torch.device, distributed: DistributedContext) -> int:
+    if not distributed.enabled:
+        return int(local_count)
+    token_tensor = torch.tensor([int(local_count)], device=device, dtype=torch.long)
+    dist.all_reduce(token_tensor, op=dist.ReduceOp.SUM)
+    return int(token_tensor.item())
+
+
+def estimate_total_train_tokens(
+    cfg: TrainConfig,
+    train_loader: DataLoader,
+    distributed: DistributedContext,
+) -> int | None:
+    max_seq_len = getattr(getattr(cfg, "sequence", None), "max_seq_len", None)
+    if max_seq_len is None:
+        return None
+    per_device_batch = getattr(
+        cfg.optimization,
+        "per_device_train_batch_size",
+        getattr(train_loader, "batch_size", None) or 1,
+    )
+    return int(
+        distributed.world_size
+        * per_device_batch
+        * cfg.optimization.gradient_accumulation_steps
+        * max_seq_len
+        * cfg.optimization.max_steps
+    )
+
+
+def estimate_remaining_seconds(
+    *,
+    start_step: int,
+    current_step: int,
+    max_steps: int,
+    elapsed_seconds: float,
+) -> float | None:
+    completed_steps = current_step - start_step
+    remaining_steps = max_steps - current_step
+    if completed_steps <= 0 or remaining_steps <= 0:
+        return 0.0 if remaining_steps <= 0 else None
+    return elapsed_seconds * remaining_steps / completed_steps
+
+
+def format_duration(seconds: float | None) -> str | None:
+    if seconds is None:
+        return None
+    total_seconds = max(0, int(round(seconds)))
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{days:02d}:{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def format_duration_compact(seconds: float | None) -> str | None:
+    if seconds is None:
+        return None
+    total_seconds = max(0, int(round(seconds)))
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, secs = divmod(remainder, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours:02d}h" if days else f"{hours}h")
+    if minutes or hours or days:
+        parts.append(f"{minutes:02d}m" if (days or hours) else f"{minutes}m")
+    parts.append(f"{secs:02d}s" if parts else f"{secs}s")
+    return " ".join(parts)
+
+
+def format_count(value: int) -> str:
+    return f"{int(value):,}"
+
+
+def format_count_or_none(value: int | None) -> str | None:
+    if value is None:
+        return None
+    return format_count(value)
+
+
+def estimate_finish_time(remaining_seconds: float | None) -> str | None:
+    if remaining_seconds is None:
+        return None
+    return (datetime.now() + timedelta(seconds=max(0.0, remaining_seconds))).isoformat(timespec="seconds")
+
+
 def make_lr_schedule(*, scheduler_type: str, warmup_steps: int, max_steps: int):
     normalized = scheduler_type.lower()
     if normalized == "cosine":
@@ -445,6 +672,8 @@ def save_checkpoint(
     scheduler: LambdaLR,
     global_step: int,
     cfg: TrainConfig,
+    train_tokens_seen: int = 0,
+    prior_stage_train_tokens: int = 0,
 ) -> None:
     checkpoint_dir = output_dir / f"checkpoint-{global_step}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -461,12 +690,27 @@ def save_checkpoint(
         },
         checkpoint_dir / TRAIN_STATE_FILE,
     )
+    write_token_accounting(
+        checkpoint_dir,
+        global_step=global_step,
+        train_tokens_seen=train_tokens_seen,
+        prior_stage_train_tokens=prior_stage_train_tokens,
+    )
     last_dir = output_dir / "last"
     if last_dir.exists():
         shutil.rmtree(last_dir)
     shutil.copytree(checkpoint_dir, last_dir)
     prune_checkpoints(output_dir, cfg.checkpointing.save_total_limit)
-    print(f"Saved checkpoint to {checkpoint_dir}")
+    print(
+        json.dumps(
+            {
+                "saved_checkpoint": str(checkpoint_dir),
+                "train_tokens_seen": format_count(train_tokens_seen),
+                "prior_stage_train_tokens": format_count(prior_stage_train_tokens),
+                "total_train_tokens_seen": format_count(int(prior_stage_train_tokens) + int(train_tokens_seen)),
+            }
+        )
+    )
 
 
 def load_training_state(checkpoint_dir: Path, optimizer: AdamW, scheduler: LambdaLR) -> int:
@@ -484,6 +728,55 @@ def load_training_state(checkpoint_dir: Path, optimizer: AdamW, scheduler: Lambd
     if "python_random_state" in state:
         random.setstate(state["python_random_state"])
     return int(state.get("global_step", 0))
+
+
+def write_token_accounting(
+    checkpoint_dir: Path,
+    *,
+    global_step: int,
+    train_tokens_seen: int,
+    prior_stage_train_tokens: int = 0,
+) -> None:
+    total_train_tokens_seen = int(prior_stage_train_tokens) + int(train_tokens_seen)
+    write_json(
+        checkpoint_dir / TOKEN_ACCOUNTING_FILE,
+        {
+            "global_step": int(global_step),
+            "train_tokens_seen": int(train_tokens_seen),
+            "prior_stage_train_tokens": int(prior_stage_train_tokens),
+            "total_train_tokens_seen": total_train_tokens_seen,
+        },
+    )
+
+
+def load_token_accounting(checkpoint_dir: Path) -> int:
+    path = checkpoint_dir / TOKEN_ACCOUNTING_FILE
+    if not path.exists():
+        return 0
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        print(json.dumps({"warning": f"Could not parse {path}; train token count resumes from 0"}))
+        return 0
+    return int(payload.get("train_tokens_seen", 0))
+
+
+def detect_prior_stage_train_tokens(cfg: TrainConfig, resume_dir: Path | None) -> int:
+    model_path = Path(cfg.model.model_path)
+    if resume_dir is not None and same_path(model_path, resume_dir):
+        return 0
+    model_path_text = str(model_path).lower()
+    run_name = getattr(cfg.run, "name", "").lower()
+    if "main" not in run_name and "warmup" not in model_path_text:
+        return 0
+    return load_token_accounting(model_path)
+
+
+def same_path(left: Path, right: Path) -> bool:
+    try:
+        return left.resolve() == right.resolve()
+    except OSError:
+        return left == right
 
 
 def prune_checkpoints(output_dir: Path, save_total_limit: int | None) -> None:
@@ -511,7 +804,7 @@ def load_torch_state(path: Path) -> dict[str, Any]:
 
 def apply_loss_weights(model: torch.nn.Module, cfg: TrainConfig) -> None:
     assignments = {
-        "lmloss_weigth": cfg.losses.lm_loss_weight,
+        "lmloss_weight": cfg.losses.lm_loss_weight,
         "auxloss_weight": cfg.losses.aux_loss_weight,
         "ansloss_weight": cfg.losses.answer_loss_weight,
         "recloss_weight": cfg.losses.reconstruction_loss_weight,
@@ -519,6 +812,26 @@ def apply_loss_weights(model: torch.nn.Module, cfg: TrainConfig) -> None:
     for name, value in assignments.items():
         if hasattr(model, name):
             setattr(model, name, value)
+
+
+def enable_gradient_checkpointing(model: torch.nn.Module) -> None:
+    if not hasattr(model, "gradient_checkpointing_enable"):
+        return
+    try:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    except TypeError:
+        model.gradient_checkpointing_enable()
+        print(
+            json.dumps(
+                {
+                    "warning": (
+                        "gradient_checkpointing_enable does not accept "
+                        "gradient_checkpointing_kwargs; DDP may require "
+                        "disabling gradient_checkpointing for this transformers version"
+                    )
+                }
+            )
+        )
 
 
 def resolve_device(requested: str, distributed: DistributedContext | None = None) -> torch.device:
@@ -679,12 +992,18 @@ def distributed_barrier(distributed: DistributedContext) -> None:
 def wrap_distributed_model(model: torch.nn.Module, device: torch.device) -> DistributedDataParallel:
     if device.type != "cuda":
         raise RuntimeError("DistributedDataParallel wrapping requires a CUDA device")
-    return DistributedDataParallel(
-        model,
-        device_ids=[device.index],
-        output_device=device.index,
-        find_unused_parameters=True,
-    )
+    kwargs = {
+        "device_ids": [device.index],
+        "output_device": device.index,
+        "find_unused_parameters": False,
+    }
+    try:
+        return DistributedDataParallel(model, static_graph=True, **kwargs)
+    except TypeError:
+        ddp_model = DistributedDataParallel(model, **kwargs)
+        if hasattr(ddp_model, "_set_static_graph"):
+            ddp_model._set_static_graph()
+        return ddp_model
 
 
 def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
