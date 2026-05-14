@@ -1,0 +1,55 @@
+{
+  "run": {
+    "name": "msa-train-smoke",
+    "seed": 7,
+    "output_dir": "outputs/train/smoke"
+  },
+  "model": {
+    "model_path": "ckpt/MSA-4B",
+    "trust_remote_code": false,
+    "torch_dtype": "bfloat16",
+    "attn_implementation": "flash_attention_2"
+  },
+  "data": {
+    "train_jsonl": "converted_training_data/smoke.jsonl",
+    "validation_jsonl": null,
+    "max_train_samples": 32,
+    "max_eval_samples": null,
+    "shuffle": false,
+    "num_workers": 0
+  },
+  "sequence": {
+    "max_seq_len": 2048,
+    "max_documents_per_sample": 4,
+    "max_document_tokens": 256,
+    "max_query_tokens": 256,
+    "max_answer_tokens": 32,
+    "packing": false
+  },
+  "optimization": {
+    "per_device_train_batch_size": 1,
+    "gradient_accumulation_steps": 1,
+    "learning_rate": 0.00001,
+    "weight_decay": 0.0,
+    "max_steps": 10,
+    "warmup_steps": 0,
+    "lr_scheduler_type": "constant",
+    "gradient_checkpointing": false,
+    "max_grad_norm": 1.0
+  },
+  "losses": {
+    "lm_loss_weight": 1.0,
+    "aux_loss_weight": 0.1,
+    "answer_loss_weight": 0.0,
+    "reconstruction_loss_weight": 0.0
+  },
+  "checkpointing": {
+    "save_steps": 10,
+    "save_total_limit": 1,
+    "resume_from_checkpoint": null
+  },
+  "logging": {
+    "logging_steps": 1,
+    "report_to": []
+  }
+}

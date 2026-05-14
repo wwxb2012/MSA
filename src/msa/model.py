@@ -296,7 +296,11 @@ class MSAForCausalLM(Qwen3PreTrainedModel, MSAGenerationMixin):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         self.aux_loss = config.msa_config.aux_loss
-        self.lmloss_weigth = config.msa_config.lmloss_weigth
+        self.lmloss_weight = getattr(
+            config.msa_config,
+            "lmloss_weight",
+            getattr(config.msa_config, "lmloss_weigth", 1.0),
+        )
         self.auxloss_weight = config.msa_config.auxloss_weight
         self.recloss_weight = config.msa_config.recloss_weight
         self.ansloss_weight = config.msa_config.ansloss_weight
@@ -502,7 +506,7 @@ class MSAForCausalLM(Qwen3PreTrainedModel, MSAGenerationMixin):
         aux_loss = aux_loss if aux_loss is not None else torch.tensor(0.0).to(hidden_states.device)
         
         if loss is not None:
-            loss = self.lmloss_weigth * loss + \
+            loss = self.lmloss_weight * loss + \
                    self.recloss_weight * reconstruction_loss + \
                    self.auxloss_weight * aux_loss + \
                    self.ansloss_weight * answer_loss
