@@ -124,11 +124,12 @@ class MemorySparseAttention(Qwen3Attention):
         
         bsz, q_len, _ = hidden_states.shape
         device, dtype = hidden_states.device, hidden_states.dtype
-        hidden_shape = (bsz, q_len, -1, self.head_dim)
+        query_shape = (bsz, q_len, self.config.num_attention_heads, self.head_dim)
+        kv_shape = (bsz, q_len, self.config.num_key_value_heads, self.head_dim)
 
-        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        query_states = self.q_norm(self.q_proj(hidden_states).view(query_shape)).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(hidden_states).view(kv_shape)).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(kv_shape).transpose(1, 2)
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         
@@ -175,7 +176,7 @@ class MemorySparseAttention(Qwen3Attention):
 
                 pooled_router_k = None
                 if self.decouple_router:
-                    r_k_raw = self.router_k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                    r_k_raw = self.router_k_proj(hidden_states).view(kv_shape).transpose(1, 2)
                     r_k_docs = r_k_raw[doc_indices[:, 0], :, doc_indices[:, 1]]
                     
                     _, chunk_lengths = torch.unique_consecutive(global_chunk_ids, return_counts=True)
@@ -260,7 +261,7 @@ class MemorySparseAttention(Qwen3Attention):
             final_k_to_scatter, final_v_to_scatter = None, None
 
             if self.is_router_layer:
-                routing_q_for_scoring = self.router_q_proj(hidden_states).view(hidden_shape).transpose(1, 2) if self.decouple_router else query_states
+                routing_q_for_scoring = self.router_q_proj(hidden_states).view(query_shape).transpose(1, 2) if self.decouple_router else query_states
                 if self.aux_loss_method == "INFONCE":
                     routing_q_for_scoring = F.normalize(routing_q_for_scoring, p=2, dim=-1)
 
@@ -539,11 +540,12 @@ class MemorySparseAttention(Qwen3Attention):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len, _ = hidden_states.shape
         device, dtype = hidden_states.device, hidden_states.dtype
-        hidden_shape = (bsz, q_len, -1, self.head_dim)
+        query_shape = (bsz, q_len, self.config.num_attention_heads, self.head_dim)
+        kv_shape = (bsz, q_len, self.config.num_key_value_heads, self.head_dim)
         
-        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        query_states = self.q_norm(self.q_proj(hidden_states).view(query_shape)).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(hidden_states).view(kv_shape)).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(kv_shape).transpose(1, 2)
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
@@ -585,12 +587,12 @@ class MemorySparseAttention(Qwen3Attention):
             routing_pooled_k_chunks = None
 
             if self.decouple_router:
-                routing_q_states = self.router_q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                routing_q_states = self.router_q_proj(hidden_states).view(query_shape).transpose(1, 2)
                 if "INFONCE" in self.aux_loss_method:
                     routing_q_states = F.normalize(routing_q_states, p=2, dim=-1)
 
 
-                r_k_raw = self.router_k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                r_k_raw = self.router_k_proj(hidden_states).view(kv_shape).transpose(1, 2)
                 r_k_raw = repeat_kv(r_k_raw, self.num_key_value_groups)
                 r_k_docs = r_k_raw[doc_indices[:, 0], :, doc_indices[:, 1]]
                 

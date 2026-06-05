@@ -218,6 +218,8 @@ class MSAGenerationMixin(GenerationMixin):
                         else:
                             source_context_list.append("")
 
+                fallback_context = tokenizer.eos_token if tokenizer.eos_token is not None else "\n"
+                source_context_list = [ctx if ctx else fallback_context for ctx in source_context_list]
                 source_batch = tokenizer(
                     source_context_list,
                     padding="longest",
@@ -228,6 +230,17 @@ class MSAGenerationMixin(GenerationMixin):
                 )
 
                 sh = source_batch['input_ids'].shape
+                if sh[1] == 0:
+                    fallback_token_id = tokenizer.eos_token_id
+                    if fallback_token_id is None:
+                        fallback_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+                    source_batch['input_ids'] = torch.full(
+                        (sh[0], 1),
+                        fallback_token_id,
+                        dtype=torch.long,
+                    )
+                    source_batch['attention_mask'] = torch.ones((sh[0], 1), dtype=torch.long)
+                    sh = source_batch['input_ids'].shape
 
                 batch_source_input_ids = source_batch['input_ids'].clone().detach().long().to(input_ids.device)
                 batch_source_attn_mask = source_batch['attention_mask'].clone().detach().long().to(input_ids.device)
