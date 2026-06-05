@@ -1,4 +1,5 @@
-from openai import OpenAI
+from google import genai
+from google.genai.types import HttpOptions
 import os
 from tqdm import tqdm
 import sys
@@ -82,39 +83,34 @@ def parse_score_result(text):
 
 def get_eval_response(prompt):
     try:
-        completion = client.chat.completions.create(
-        extra_headers={
-        },
-        extra_body={},
-        model='google/gemini-2.5-flash',
-        messages=[
-            {
-            "role": "user",
-            "content": [
-                {
-                "type": "text",
-                "text":  prompt
-                },
-            ]
-            }
-        ],
-        temperature=0.0 
+        response = client.models.generate_content(
+            model=JUDGE_MODEL,
+            contents=prompt,
         )
-        return completion.choices[0].message.content
+        return response.text if response and response.text else ''
     except Exception as e:
         print(e)
         return ''
 
 if __name__ == "__main__":
     dirname = sys.argv[1]
-    openrouter_api_key = os.environ.get("OPENROUTER_API_KEY", "")
-    if not openrouter_api_key:
-        raise ValueError("Please set the OPENROUTER_API_KEY environment variable.")
-    client = OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=openrouter_api_key,
-    )
-    JUDGE_MODEL = 'google/gemini-2.5-flash'
+    use_vertex = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "true").lower() == "true"
+    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
+    if use_vertex and not project_id:
+        raise ValueError("Please set GOOGLE_CLOUD_PROJECT when using Vertex AI.")
+
+    if use_vertex:
+        client = genai.Client(
+            vertexai=True,
+            project=project_id,
+            location=location,
+            http_options=HttpOptions(api_version="v1"),
+        )
+    else:
+        client = genai.Client(http_options=HttpOptions(api_version="v1"))
+
+    JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "gemini-2.5-flash")
     if dirname.endswith(".json") and os.path.isfile(dirname):
         json_dir = os.path.split(dirname)[0]
         json_paths = [dirname]
